@@ -9,6 +9,7 @@ import java.net.InetSocketAddress;
 public class TOUSegmentFactory {
     private final InetSocketAddress local;
     private final InetSocketAddress remote;
+    private final TCPSegmentFactory tcpSegmentFactory = new TCPSegmentFactory();
 
     public TOUSegmentFactory(InetSocketAddress local, InetSocketAddress remote) {
         this.local = local;
@@ -16,6 +17,6 @@ public class TOUSegmentFactory {
     }
 
     public TCPSegment create(TCPSegmentType type, Object... args) {
-        return new TOUSegment(TCPSegmentFactory.create(type, args), local, remote);
+        return new TOUSegment(tcpSegmentFactory.create(type, args), local, remote);
     }
 }

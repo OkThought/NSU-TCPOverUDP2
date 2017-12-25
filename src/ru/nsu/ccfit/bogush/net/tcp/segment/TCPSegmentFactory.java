@@ -9,7 +9,7 @@ import java.util.concurrent.ThreadLocalRandom;
 
 import static ru.nsu.ccfit.bogush.net.tcp.segment.TCPSegmentType.*;
 
-public abstract class TCPSegmentFactory implements Factory<TCPSegment, TCPSegmentType> {
+public class TCPSegmentFactory implements Factory<TCPSegment, TCPSegmentType> {
     public final HashMap<CreatorKey, Creator<TCPSegment>> creators = new HashMap<>();
     {
         creators.put(new CreatorKey(SYN),
