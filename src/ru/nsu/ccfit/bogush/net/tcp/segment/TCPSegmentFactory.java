@@ -66,7 +66,9 @@ public class TCPSegmentFactory implements Factory<TCPSegment, TCPSegmentType> {
                         .setACK(((TCPSegment) args[0]).getSEQ() + 1));
 
         creators.put(new CreatorKey(ORDINARY, byte[].class, Integer.class),
-                args -> new TCPSegment((byte[]) args[0]).setSEQ((int) args[1]));
+                args -> new TCPSegment(((byte[]) args[0]).length)
+                        .setData((byte[]) args[0])
+                        .setSEQ((int) args[1]));
     }
 
     private static int rand() {
