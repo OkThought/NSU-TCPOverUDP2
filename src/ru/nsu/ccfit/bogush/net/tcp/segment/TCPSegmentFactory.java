@@ -10,8 +10,8 @@ import java.util.concurrent.ThreadLocalRandom;
 import static ru.nsu.ccfit.bogush.net.tcp.segment.TCPSegmentType.*;
 
 public class TCPSegmentFactory implements Factory<TCPSegment, TCPSegmentType> {
-    public final HashMap<CreatorKey, Creator<TCPSegment>> creators = new HashMap<>();
-    {
+    private static final HashMap<CreatorKey, Creator<TCPSegment>> creators = new HashMap<>();
+    static {
         creators.put(new CreatorKey(SYN),
                 args -> new TCPSegment()
                         .setSEQ(rand())
@@ -75,6 +75,10 @@ public class TCPSegmentFactory implements Factory<TCPSegment, TCPSegmentType> {
 
     @Override
     public TCPSegment create(TCPSegmentType type, Object... args) {
+        return staticCreate(type, args);
+    }
+
+    public static TCPSegment staticCreate(TCPSegmentType type, Object... args) {
         Class[] argTypes = new Class[args.length];
         for (int i = 0; i < args.length; i++) {
             argTypes[i] = args.getClass();
