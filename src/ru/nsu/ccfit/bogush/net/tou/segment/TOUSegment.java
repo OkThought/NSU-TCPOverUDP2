@@ -9,6 +9,12 @@ public class TOUSegment extends TCPSegment {
     private final InetSocketAddress dst;
     private long timeout = -1;
 
+    public TOUSegment(TOUSegment segment) {
+        super(segment.getBytes().clone());
+        src = segment.getSrc();
+        dst = segment.getDst();
+    }
+
     public TOUSegment(TCPSegment segment, InetSocketAddress src, InetSocketAddress dst) {
         super(segment.getBytes());
         this.src = src;
