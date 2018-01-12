@@ -79,6 +79,22 @@ public class BlockingCircularDoublyLinkedList<E> {
         return e;
     }
 
+    private void removeNode(ListNode node) {
+        if (node != null) {
+            if (size == 1) {
+                head = null;
+            } else {
+                node.prev.next = node.next;
+                node.next.prev = node.prev;
+                if (head == node) {
+                    head = node.next;
+                }
+            }
+            --size;
+            monitor.notifyAll();
+        }
+    }
+
     private void removeHead() {
         if (size == 1) {
             head = null;
@@ -167,5 +183,27 @@ public class BlockingCircularDoublyLinkedList<E> {
         synchronized (monitor) {
             return size == 0;
         }
+    }
+
+    public boolean removeIf(Predicate<E> p) {
+        boolean removed = false;
+
+        synchronized (monitor) {
+            ListNode node = head;
+
+            do {
+                if (p.test(node.elem)) {
+                    removeNode(node);
+                    removed = true;
+                }
+                node = node.next;
+            } while (node != head.prev);
+
+            if (removed) {
+                monitor.notifyAll();
+            }
+        }
+
+        return removed;
     }
 }
