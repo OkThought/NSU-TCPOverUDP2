@@ -21,12 +21,12 @@ public class TOUSegmentFactory implements Factory<TOUSegment, TCPSegmentType> {
         return new TOUSegment(tcpSegmentFactory.create(type, args), local, remote);
     }
 
-    public static TOUSegment create(TCPSegmentType type, InetSocketAddress local, InetSocketAddress remote,
-                                    Object... args) {
+    public static TOUSegment staticCreate(TCPSegmentType type, InetSocketAddress local, InetSocketAddress remote,
+                                          Object... args) {
         return new TOUSegment(TCPSegmentFactory.staticCreate(type, args), local, remote);
     }
 
-    public static TOUSegment create(TCPSegmentType type, TOUSegment segment) {
+    public static TOUSegment staticCreate(TCPSegmentType type, TOUSegment segment) {
         return new TOUSegment(TCPSegmentFactory.staticCreate(type, segment), segment.getDst(), segment.getSrc());
     }
 }
