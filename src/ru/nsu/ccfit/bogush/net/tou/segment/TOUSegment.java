@@ -23,7 +23,7 @@ public class TOUSegment extends TCPSegment {
         return dst;
     }
 
-    public void setTimeout(int timeout) {
+    public void setTimeout(long timeout) {
         this.timeout = System.currentTimeMillis() + timeout;
     }
 
