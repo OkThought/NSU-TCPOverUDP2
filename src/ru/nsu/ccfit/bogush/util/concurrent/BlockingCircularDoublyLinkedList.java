@@ -1,5 +1,7 @@
 package ru.nsu.ccfit.bogush.util.concurrent;
 
+import java.util.function.Predicate;
+
 public class BlockingCircularDoublyLinkedList<E> {
     private static final int MAX_CAPACITY = Integer.MAX_VALUE;
 
@@ -72,19 +74,22 @@ public class BlockingCircularDoublyLinkedList<E> {
             }
 
             e = head.elem;
-
-            if (size == 1) {
-                head = null;
-            } else {
-                head.prev.next = head.next;
-                head.next.prev = head.prev;
-                head = head.next;
-            }
-
-            --size;
-            monitor.notifyAll();
+            removeHead();
         }
         return e;
+    }
+
+    private void removeHead() {
+        if (size == 1) {
+            head = null;
+        } else {
+            head.prev.next = head.next;
+            head.next.prev = head.prev;
+            head = head.next;
+        }
+
+        --size;
+        monitor.notifyAll();
     }
 
     public E peek() {
@@ -95,24 +100,67 @@ public class BlockingCircularDoublyLinkedList<E> {
 
     public E next()
             throws InterruptedException {
+        E e;
         synchronized (monitor) {
             while (head == null) {
                 monitor.wait();
             }
+
+            e = head.elem;
             head = head.next;
-            return head.elem;
         }
+        return e;
+    }
+
+    public E next(Predicate<E> keepHead)
+            throws InterruptedException {
+        E e;
+        synchronized (monitor) {
+            while (head == null) {
+                monitor.wait();
+            }
+
+            e = head.elem;
+            if (keepHead.test(e)) {
+                head = head.next;
+            } else {
+                removeHead();
+            }
+        }
+        return e;
     }
 
     public E prev()
             throws InterruptedException {
+        E e;
         synchronized (monitor) {
             while (head == null) {
                 monitor.wait();
             }
+
+            e = head.elem;
             head = head.prev;
-            return head.elem;
         }
+        return e;
+    }
+
+    public E prev(Predicate<E> keepHead)
+            throws InterruptedException {
+        E e;
+        synchronized (monitor) {
+            while (head == null) {
+                monitor.wait();
+            }
+
+            e = head.elem;
+            if (keepHead.test(e)) {
+                head = head.next;
+            } else {
+                removeHead();
+                head = head.prev;
+            }
+        }
+        return e;
     }
 
     public boolean isEmpty() {
