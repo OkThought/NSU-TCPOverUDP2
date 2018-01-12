@@ -7,6 +7,7 @@ import java.net.InetSocketAddress;
 public class TOUSegment extends TCPSegment {
     private final InetSocketAddress src;
     private final InetSocketAddress dst;
+    private long timeout = -1;
 
     public TOUSegment(TCPSegment segment, InetSocketAddress src, InetSocketAddress dst) {
         super(segment.getBytes());
@@ -20,6 +21,15 @@ public class TOUSegment extends TCPSegment {
 
     public InetSocketAddress getDst() {
         return dst;
+    }
+
+    public void setTimeout(int timeout) {
+        this.timeout = System.currentTimeMillis() + timeout;
+    }
+
+    public boolean timedOut() {
+        long t = System.currentTimeMillis();
+        return t >= timeout;
     }
 
     @Override
