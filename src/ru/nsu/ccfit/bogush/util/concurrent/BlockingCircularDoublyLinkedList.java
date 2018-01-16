@@ -62,7 +62,7 @@ public class BlockingCircularDoublyLinkedList<E> {
 
     public void putPrev(E elem)
             throws InterruptedException {
-        putAfter(head.prev, elem);
+        putAfter(head == null ? null : head.prev, elem);
     }
 
     public E take()
