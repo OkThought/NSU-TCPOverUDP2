@@ -29,8 +29,9 @@ public class TOUSegment extends TCPSegment {
         return dst;
     }
 
-    public void setTimeout(long timeout) {
+    public TOUSegment setTimeout(long timeout) {
         this.timeout = System.currentTimeMillis() + timeout;
+        return this;
     }
 
     public boolean timedOut() {
