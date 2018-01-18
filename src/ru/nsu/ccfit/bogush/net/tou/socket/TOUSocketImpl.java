@@ -12,31 +12,64 @@ import java.net.*;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.concurrent.ArrayBlockingQueue;
+import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Predicate;
 
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 import static ru.nsu.ccfit.bogush.net.tcp.segment.TCPSegmentType.*;
 
+/**
+ * <p>
+ *     A TCP over UDP socket implementation using only one {@link DatagramSocket} (aka UDP socket)
+ *     and fixed amount of internal threads. The instances of this class have a shared communicator
+ *     that encapsulates sending and receiving of UDP packets. It with underlying UDP socket as
+ *     its field is shared between implementations of one group.
+ * </p>
+ *
+ * <p>
+ *     Two implementations are considered to be in one group if
+ *     <ul>
+ *      <li>one of them is a server socket implementation and the other one is accepted by the first</li>
+ *      <li>or they are both accepted by the same server socket implementation</li>
+ *     </ul>
+ * </p>
+ *
+ * <p>
+ *     A shared communicator keeps a reference to every impl in group. When socket is closed it
+ *     notifies the communicator using {@link TOUSharedCommunicator#socketClosed}. When notified
+ *     communicator removes the reference of the closed impl from its container and closes the UDP socket
+ *     if the group has become empty.
+ * </p>
+ */
 public class TOUSocketImpl extends SocketImpl {
     private static final int SEGMENT_QUEUE_CAPACITY = 32;
-    private static final int ACK_QUEUE_CAPACITY = 64;
     private static final long DEFAULT_SEGMENT_TIMEOUT = 1000; // milliseconds
     private static final HashMap<TCPSegmentType, Long> SEGMENT_TIMEOUT_MAP = new HashMap<>();
+    private static final int NUM_CORE_THREADS = 4;
+    private static final int RESENDING_PERIOD = 10; // milliseconds
+
     static {
         SEGMENT_TIMEOUT_MAP.put(SYN, Long.MAX_VALUE);
     }
 
     private TOUSegmentFactory segmentFactory;
-    private TOUSharedCommunicator communicator;
+    TOUSharedCommunicator communicator;
     private InetSocketAddress local;
     private InetSocketAddress remote;
-    private final HashMap<TCPSegmentType, ArrayBlockingQueue<TOUSegment>> segmentQueueMap = new HashMap<>();
+    private final HashMap<TCPSegmentType, BlockingQueue<TOUSegment>> receivedSegmentsQueueMap = new HashMap<>();
     private final ArrayBlockingQueue<Integer> ackQueue = new ArrayBlockingQueue<Integer>(SEGMENT_QUEUE_CAPACITY);
+    private final ConcurrentHashMap<Integer, ScheduledFuture<?>> sendDataFutureTasks = new ConcurrentHashMap<>();
     private int initialReadSEQ = 0;
     private int initialWriteSEQ = 0;
 
     private boolean isServerSocket = false;
     private boolean bound = false;
     private boolean connected = false;
+    private volatile boolean shutIn = false;
+    private boolean shutOut = false;
 
     @Override
     protected void create(boolean stream)
@@ -63,17 +96,17 @@ public class TOUSocketImpl extends SocketImpl {
         communicator.datagramSocket.connect(address, port);
         remote = (InetSocketAddress) communicator.datagramSocket.getRemoteSocketAddress();
         segmentFactory = new TOUSegmentFactory(local, remote);
-        segmentQueueMap.put(SYNACK, new ArrayBlockingQueue<>(1));
+        receivedSegmentsQueueMap.put(SYNACK, new ArrayBlockingQueue<>(1));
         // three-way handshake: SYN(x,?) -> SYNACK(y,x+1) -> ACK(x+1,y+1)
         TOUSegment syn = segmentFactory.create(SYN);
         try {
-            communicator.putInSendingQueue(syn);
+            ScheduledFuture<?> future = sendRepeatedly(syn, DEFAULT_SEGMENT_TIMEOUT);
             communicator.start();
             int x = syn.getSEQ();
             TOUSegment synack = fetch(SYNACK, s -> s.getACK() == x+1);
             int y = synack.getSEQ();
-            communicator.removeReference(syn);
-            segmentQueueMap.remove(SYNACK);
+            future.cancel(true);
+            receivedSegmentsQueueMap.remove(SYNACK);
             ackQueue.put(y+1);
             initialReadSEQ = y+1;
             initialWriteSEQ = x+1;
@@ -92,8 +125,17 @@ public class TOUSocketImpl extends SocketImpl {
 
     private void bind(InetSocketAddress address)
             throws SocketException {
-        communicator = new TOUSharedCommunicator(address, SEGMENT_QUEUE_CAPACITY);
-        local = (InetSocketAddress) communicator.datagramSocket.getLocalSocketAddress();
+        communicator = new TOUSharedCommunicator(address, NUM_CORE_THREADS);
+//        if (communicator.localSocketAddress.getAddress().isAnyLocalAddress()) {
+//            try {
+//                communicator.localSocketAddress = new InetSocketAddress(InetAddress.getLocalHost(),
+//                        communicator.datagramSocket.getLocalPort());
+//            } catch (UnknownHostException e) {
+//                e.printStackTrace();
+//                System.exit(-1);
+//            }
+//        }
+        local = communicator.localSocketAddress;
         bound = true;
     }
 
@@ -101,7 +143,8 @@ public class TOUSocketImpl extends SocketImpl {
     protected void listen(int backlog)
             throws IOException {
         isServerSocket = true;
-        segmentQueueMap.put(SYN, new ArrayBlockingQueue<>(backlog));
+        receivedSegmentsQueueMap.put(SYN, new ArrayBlockingQueue<>(backlog));
+        communicator.registerImpl(local, this);
         communicator.start();
     }
 
@@ -112,13 +155,13 @@ public class TOUSocketImpl extends SocketImpl {
         TOUSocketImpl impl = (TOUSocketImpl) si;
         // three-way handshake: SYN(x,?) -> SYNACK(y,x+1) -> ACK(x+1,y+1)
         try {
-            TOUSegment syn = segmentQueueMap.get(SYN).take();
+            TOUSegment syn = receivedSegmentsQueueMap.get(SYN).take();
             int x = syn.getSEQ();
-            segmentQueueMap.put(ORDINARY, new ArrayBlockingQueue<>(SEGMENT_QUEUE_CAPACITY));
-            segmentQueueMap.put(ACK, new ArrayBlockingQueue<>(SEGMENT_QUEUE_CAPACITY));
+            receivedSegmentsQueueMap.put(ORDINARY, new ArrayBlockingQueue<>(SEGMENT_QUEUE_CAPACITY));
+            receivedSegmentsQueueMap.put(ACK, new ArrayBlockingQueue<>(SEGMENT_QUEUE_CAPACITY));
             TOUSegment synack = segmentFactory.create(SYNACK, syn);
             int y = synack.getSEQ();
-            communicator.putInSendingQueue(synack);
+            ScheduledFuture<?> future = sendRepeatedly(synack, DEFAULT_SEGMENT_TIMEOUT);
             impl.local = local;
             impl.bound = true;
             impl.remote = syn.getSrc();
@@ -127,11 +170,9 @@ public class TOUSocketImpl extends SocketImpl {
             impl.fetch(ACK, s -> s.getSEQ() == x+1 && s.getACK() == y+1);
             initialReadSEQ = x+1;
             initialWriteSEQ = y+1;
-            communicator.removeReference(synack);
+            future.cancel(true);
             impl.connected = true;
-        } catch (InterruptedException e) {
-            e.printStackTrace();
-        }
+        } catch (InterruptedException ignored) {}
     }
 
     private TOUInputStream in;
@@ -139,10 +180,29 @@ public class TOUSocketImpl extends SocketImpl {
     @Override
     protected InputStream getInputStream()
             throws IOException {
+        if (!connected) throw new IOException("Socket not connected");
         if (in == null) {
             in = new TOUInputStream(this);
         }
         return in;
+    }
+
+    @Override
+    protected void shutdownInput()
+            throws IOException {
+        if (shutIn) return;
+        shutIn = true;
+        if (in != null) {
+            in.setEof(true);
+            // wake up threads waiting on read
+            synchronized (receivedSegmentsQueueMap) {
+                receivedSegmentsQueueMap.notifyAll();
+            }
+        }
+    }
+
+    boolean isInShut() {
+        return shutIn;
     }
 
     private TOUOutputStream out;
@@ -150,56 +210,105 @@ public class TOUSocketImpl extends SocketImpl {
     @Override
     protected OutputStream getOutputStream()
             throws IOException {
+        if (!connected) throw new IOException("Socket not connected");
+        if (isClosedOrPending()) throw new IOException("Socket closed");
         if (out == null) {
             out = new TOUOutputStream(this);
         }
         return out;
     }
 
-    private boolean closePending = false;
+    @Override
+    protected void shutdownOutput()
+            throws IOException {
+        if (shutOut) return;
+        shutOut = true;
+
+        if (!closingPassively) {
+            activeClose();
+        }
+    }
+
+    boolean isOutShut() {
+        return shutOut;
+    }
+
+    private boolean isClosed() {
+        return communicator == null || communicator.isClosed();
+    }
+
+    private final AtomicBoolean closePending = new AtomicBoolean(false);
 
     boolean isClosedOrPending() {
-        return closePending || communicator == null || communicator.isClosed();
+        return closePending.get() || isClosed();
     }
 
     @Override
     protected void close()
             throws IOException {
-        if (isClosedOrPending()) {
-            return;
-        }
+        if (closePending.getAndSet(true) || isClosed()) return;
+        // wait until all segments are sent
+        // and perform three-way handshake FIN->FINACK->ACK
+        shutdownOutput();
+        shutdownInput();
+    }
 
-        closePending = true;
+    private void activeClose()
+            throws IOException {
+        // three-way handshake: FIN(x,?) -> FINACK(y,x+1) -> ACK(x+1,y+1)
+        try {
+            TOUSegment fin = segmentFactory.create(FIN);
+            ScheduledFuture<?> future = sendRepeatedly(fin, DEFAULT_SEGMENT_TIMEOUT);
+            int x = fin.getSEQ();
+            TOUSegment finack = fetch(FINACK, s -> s.getACK() == x+1);
+            future.cancel(true);
+            TOUSegment ack = segmentFactory.create(ACK, finack);
+            communicator.sendOnce(ack);
+            Thread.sleep(DEFAULT_SEGMENT_TIMEOUT);
+            finishClose();
+        } catch (InterruptedException ignored) {}
+    }
 
-        // close
+    private boolean closingPassively = false;
+    private void passiveClose(TOUSegment fin)
+            throws IOException {
+        boolean wasClosePending = closePending.getAndSet(true);
+        closePending.set(true);
 
+        // second step in three-way handshake: FIN(x,?) -> FIN-ACK(y,x+1) -> ACK(x+1,y+1)
+        TOUSegment finack = segmentFactory.create(FINACK, fin);
+
+        communicator.sendOnce(finack);
+
+        if (wasClosePending) return;
+
+        closingPassively = true;
+
+        shutdownOutput();
+
+        // wait until all data segments are read from queue
+        waitUntilReceivedSegmentsQueueIsEmpty(ORDINARY);
+
+        shutdownInput();
+        receivedSegmentsQueueMap.remove(ORDINARY);
+    }
+
+    private void finishClose() {
+        bound = false;
+        connected = false;
+        // close finished
+        // notify shared communicator about it so it could terminate
         communicator.socketClosed(this);
     }
 
-    private void activeClose() {
-        try {
-            TOUSegment fin = segmentFactory.create(FIN);
-            communicator.putInSendingQueue(fin);
-
-        } catch (InterruptedException e) {
-            e.printStackTrace();
-        }
-    }
-
-    private void passiveClose(TOUSegment fin) {
-        // three-way handshake: FIN(x,?) -> FINACK(y,x+1) -> ACK(x+1,y+1)
-        try {
-            TOUSegment finack = segmentFactory.create(FINACK, fin);
-            communicator.putInSendingQueue(finack);
-            synchronized (segmentQueueMap) {
-                ArrayBlockingQueue<TOUSegment> ackQueue = segmentQueueMap.get(ACK);
-                while (!ackQueue.removeIf(s -> s.getACK() == finack.getSEQ() + 1 && s.getSEQ() == finack.getACK())) {
-                    segmentQueueMap.wait();
-                }
+    private void waitUntilReceivedSegmentsQueueIsEmpty(TCPSegmentType type) {
+        BlockingQueue<TOUSegment> queue = receivedSegmentsQueueMap.get(type);
+        synchronized (receivedSegmentsQueueMap) {
+            while (!queue.isEmpty()) {
+                try {
+                    receivedSegmentsQueueMap.wait();
+                } catch (InterruptedException ignored) {}
             }
-        } catch (InterruptedException e) {
-            e.printStackTrace();
-            return;
         }
     }
 
@@ -228,10 +337,14 @@ public class TOUSocketImpl extends SocketImpl {
     }
 
     void handle(TOUSegment segment)
-            throws InterruptedException {
+            throws InterruptedException, IOException {
         if (segment.dataSize() > 0) {
-            putInQueue(ORDINARY, segment);
-            ackQueue.put(segment.getSEQ());
+            if (!shutIn) {
+                putInQueue(ORDINARY, segment);
+                ackQueue.put(segment.getSEQ());
+            } else {
+                communicator.sendOnce(segmentFactory.create(ACK, segment.getSEQ()));
+            }
         }
 
         if (segment.isACK()) {
@@ -240,58 +353,100 @@ public class TOUSocketImpl extends SocketImpl {
             } else if (segment.isFIN()) {
                 putInQueue(FINACK, segment);
             } else {
-                communicator.removeByAck(segment);
+                if (closingPassively && shutIn) {
+                    finishClose();
+                } else {
+                    ScheduledFuture<?> future = sendDataFutureTasks.remove(segment.getACK());
+                    if (future != null) {
+                        future.cancel(true);
+                    } else {
+                        putInQueue(ACK, segment);
+                    }
+                }
             }
         } else {
             if (segment.isSYN()) {
                 putInQueue(SYN, segment);
             } else if (segment.isFIN()) {
                 passiveClose(segment);
-            }
+            } // else it's just a data segment that's already been handled before.
         }
     }
 
+    private ScheduledFuture<?> sendRepeatedly(TOUSegment s, long timeout)
+            throws InterruptedException {
+        return communicator.sendRepeatedly(s.setTimeout(timeout), RESENDING_PERIOD, MILLISECONDS);
+    }
+
     void sweepTimedOutSegmentsFromQueues() {
-        for (ArrayBlockingQueue<TOUSegment> queue : segmentQueueMap.values()) {
+        for (BlockingQueue<TOUSegment> queue : receivedSegmentsQueueMap.values()) {
             queue.removeIf(TOUSegment::timedOut);
         }
     }
 
     private void putInQueue(TCPSegmentType type, TOUSegment segment)
             throws InterruptedException {
-        ArrayBlockingQueue<TOUSegment> queue = segmentQueueMap.get(type);
+        BlockingQueue<TOUSegment> queue = receivedSegmentsQueueMap.get(type);
         if (queue == null) {
             return;
         }
-        synchronized (segmentQueueMap) {
+        synchronized (receivedSegmentsQueueMap) {
             if (queue.contains(segment)) {
                 return;
             }
             segment.setTimeout(SEGMENT_TIMEOUT_MAP.getOrDefault(type, (long) 0));
             queue.put(segment);
-            segmentQueueMap.notifyAll();
+            receivedSegmentsQueueMap.notifyAll();
         }
     }
 
-    private TOUSegment fetch(ArrayBlockingQueue<TOUSegment> queue, Predicate<TOUSegment> predicate)
+    private TOUSegment tryFetch(BlockingQueue<TOUSegment> queue, Predicate<TOUSegment> predicate) {
+        Iterator<TOUSegment> iterator = queue.iterator();
+        while (iterator.hasNext()) {
+            TOUSegment segment = iterator.next();
+            if (predicate.test(segment)) {
+                iterator.remove();
+                return segment;
+            }
+        }
+        return null;
+    }
+
+
+    private TOUSegment tryFetch(TCPSegmentType type, Predicate<TOUSegment> predicate) {
+        return tryFetch(receivedSegmentsQueueMap.get(type), predicate);
+    }
+
+    /**
+     * Blocks until there is a segment in the {@code queue} that satisfies the {@code predicate}.
+     * Different threads may block performing a fetch:<br>
+     * <li>User thread
+     *  <ul>
+     *      <li>waiting for SYN-ACK segment in connect()</li>
+     *      <li>waiting for FIN-ACK segment in close()</li>
+     *      <li>requesting subsequent data in read()</li>
+     *  </ul>
+     * </li>
+     *
+     * <li>A TOU internal thread
+     *  <ul>
+     *      <li>handling a received FIN segment</li>
+     *  </ul>
+     * </li>
+     * @return the first segment in the queue that satisfies the {@code predicate} or {@code null} if ...
+     *     The order is specified in {@link ArrayBlockingQueue#iterator}
+     */
+    private TOUSegment fetch(BlockingQueue<TOUSegment> queue, Predicate<TOUSegment> predicate)
             throws InterruptedException {
         queue.iterator();
         TOUSegment fetched = null;
         while (fetched == null) {
-            Iterator<TOUSegment> iterator = queue.iterator();
-            while (iterator.hasNext()) {
-                TOUSegment next = iterator.next();
-                if (predicate.test(next)) {
-                    iterator.remove();
-                    fetched = next;
-                    break;
-                }
-            }
-            synchronized (segmentQueueMap) {
+            fetched = tryFetch(queue, predicate);
+            synchronized (receivedSegmentsQueueMap) {
                 if (fetched == null) {
-                    segmentQueueMap.wait();
+                    receivedSegmentsQueueMap.wait();
                 } else {
-                    segmentQueueMap.notifyAll();
+                    receivedSegmentsQueueMap.notifyAll();
                 }
             }
         }
@@ -300,22 +455,51 @@ public class TOUSocketImpl extends SocketImpl {
 
     private TOUSegment fetch(TCPSegmentType type, Predicate<TOUSegment> predicate)
             throws InterruptedException {
-        ArrayBlockingQueue<TOUSegment> queue = segmentQueueMap.get(type);
+        BlockingQueue<TOUSegment> queue = receivedSegmentsQueueMap.get(type);
         return fetch(queue, predicate);
     }
 
     byte[] fetchData(int seq)
-            throws InterruptedException {
-        return fetch(ORDINARY, s -> s.getSEQ() == seq).getData();
+            throws InterruptedException, IOException {
+        if (isClosedOrPending()) throw new IOException("Socket closed");
+        TOUSegment fetched;
+
+        while (true) {
+            fetched = tryFetch(ORDINARY, s -> s.getSEQ() == seq);
+
+            if (fetched != null) {
+                break;
+            }
+
+            if (shutIn) {
+                return null;
+            }
+
+            synchronized (receivedSegmentsQueueMap) {
+                receivedSegmentsQueueMap.wait();
+            }
+        }
+
+        synchronized (receivedSegmentsQueueMap) {
+            receivedSegmentsQueueMap.notifyAll();
+        }
+
+        return fetched.getData();
+
     }
 
-    TOUSegment flushIfAvailable() {
-        if (out == null) return null;
+    void flushAndSendIfAvailable()
+            throws InterruptedException {
+        if (out == null) return;
         int available = out.available();
-        if (available <= 0) return null;
-        int seq = out.getCurrentSEQ();
-        byte[] data = out.flushBytes();
-        return new TOUSegment(new TCPSegment(data.length).setData(data), local, remote);
+        if (available <= 0) return;
+        TCPSegment tcpSegment = out.flushIntoSegment();
+        TOUSegment dataSegment = new TOUSegment(tcpSegment, local, remote);
+        Integer ack = ackQueue.poll();
+        if (ack != null) {
+            dataSegment.setACK(true).setACK(ack);
+        }
+        sendDataFutureTasks.put(dataSegment.getSEQ(), sendRepeatedly(dataSegment, DEFAULT_SEGMENT_TIMEOUT));
     }
 
     int getInitialReadSEQ() {

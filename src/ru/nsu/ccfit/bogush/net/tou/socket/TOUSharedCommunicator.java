@@ -3,13 +3,11 @@ package ru.nsu.ccfit.bogush.net.tou.socket;
 import ru.nsu.ccfit.bogush.net.tcp.segment.TCPSegment;
 import ru.nsu.ccfit.bogush.net.tcp.segment.TCPSegmentType;
 import ru.nsu.ccfit.bogush.net.tou.segment.TOUSegment;
-import ru.nsu.ccfit.bogush.util.concurrent.BlockingCircularDoublyLinkedList;
 
 import java.io.IOException;
 import java.net.*;
 import java.util.HashMap;
-import java.util.Objects;
-import java.util.function.Predicate;
+import java.util.concurrent.*;
 
 import static ru.nsu.ccfit.bogush.net.tcp.segment.TCPSegmentType.*;
 
@@ -23,95 +21,128 @@ class TOUSharedCommunicator {
     private static final int SWEEPING_PERIOD = 100; // milliseconds
 
     final DatagramSocket datagramSocket;
-    private final InetSocketAddress localSocketAddress;
+    InetSocketAddress localSocketAddress;
     private final HashMap<InetSocketAddress, TOUSocketImpl> implMap = new HashMap<>();
-    private final Thread segmentSender = new Thread(this::segmentSenderRun,"SegmentSender");
-    private final Thread segmentReceiver = new Thread(this::segmentReceiverRun, "SegmentReceiver");
-    private final BlockingCircularDoublyLinkedList<TOUSegment> segmentQueue;
-    private volatile boolean shouldStop = false;
+    private final SegmentReceiver segmentReceiver = new SegmentReceiver();
+    final LinkedBlockingQueue<TOUSocketImpl> implsWithData;
+    private final ScheduledThreadPoolExecutor threadPoolExecutor;
+    private boolean shouldStop = false;
 
-    TOUSharedCommunicator(InetSocketAddress address, int queueCapacity)
+    TOUSharedCommunicator(InetSocketAddress address, int corePoolSize)
             throws SocketException {
         datagramSocket = new DatagramSocket(address);
         localSocketAddress = address;
-        segmentQueue = new BlockingCircularDoublyLinkedList<>(queueCapacity);
+        threadPoolExecutor = new ScheduledThreadPoolExecutor(corePoolSize);
+        implsWithData = new LinkedBlockingQueue<>();
+    }
+
+    private class SegmentReceiver extends Thread {
+        private SegmentReceiver() {
+            super("TOUSegmentReceiver");
+        }
+
+        @Override
+        public void run() {
+            try {
+                DatagramPacket packet = new DatagramPacket(new byte[UDP_PACKET_DATA_SIZE], UDP_PACKET_DATA_SIZE);
+                while (!shouldStop) {
+                    try {
+                        datagramSocket.receive(packet);
+                    } catch (SocketTimeoutException e) {
+                        System.out.println("receiver timed out");
+                        continue;
+                    }
+                    InetAddress address = packet.getAddress();
+                    int port = packet.getPort();
+                    InetSocketAddress socketAddress = new InetSocketAddress(address, port);
+                    TOUSegment segment = new TOUSegment(new TCPSegment(packet.getData()), socketAddress, localSocketAddress);
+                    TCPSegmentType type = TCPSegmentType.typeOf(segment);
+                    TOUSocketImpl impl;
+
+                    if (type == SYN) {
+                        // SYN segment addressed to server socket associated with local address
+                        impl = implMap.get(localSocketAddress);
+                    } else {
+                        // other segments addressed to socket associated with remote address
+                        impl = implMap.get(socketAddress);
+                    }
+
+                    if (impl == null) {
+                        continue;
+                    }
+
+                    impl.handle(segment);
+                }
+            } catch (InterruptedException | IOException e) {
+                e.printStackTrace();
+            }
+        }
     }
 
     void start() {
-        segmentSender.start();
         segmentReceiver.start();
+        startSweeper();
+        startFlusher();
     }
 
-    private void segmentSenderRun() {
-        try {
-            DatagramPacket packet = new DatagramPacket(new byte[UDP_PACKET_DATA_SIZE], UDP_PACKET_DATA_SIZE);
-            long sweepingTime = 0;
-            while (!shouldStop) {
-                TOUSegment segment;
-                segment = segmentQueue.next(s -> !s.timedOut());
-                packet.setData(segment.getBytes());
-                datagramSocket.send(packet);
+    private void send(TOUSegment segment)
+            throws IOException {
+        datagramSocket.send(new DatagramPacket(segment.getBytes(), segment.size()));
+    }
 
-                long t;
-                if (sweepingTime <= (t = System.currentTimeMillis())) {
-                    sweepingTime = t + SWEEPING_PERIOD;
-                    for (TOUSocketImpl impl : implMap.values()) {
-                        impl.sweepTimedOutSegmentsFromQueues();
-                    }
-                }
-            }
-        } catch (InterruptedException | IOException e) {
-            e.printStackTrace();
+    private static final RuntimeException SEGMENT_TIMED_OUT = new RuntimeException("segment timed out") {
+        @Override
+        public synchronized Throwable fillInStackTrace() {
+            super.fillInStackTrace();
+            return this;
         }
-    }
+    };
 
-    private void segmentReceiverRun() {
-        try {
-            DatagramPacket packet = new DatagramPacket(new byte[UDP_PACKET_DATA_SIZE], UDP_PACKET_DATA_SIZE);
-            while (!shouldStop) {
-                try {
-                    datagramSocket.receive(packet);
-                } catch (SocketTimeoutException e) {
-                    System.out.println("receiver timed out");
-                    continue;
-                }
-                InetAddress address = packet.getAddress();
-                int port = packet.getPort();
-                InetSocketAddress socketAddress = new InetSocketAddress(address, port);
-                TOUSegment segment = new TOUSegment(new TCPSegment(packet.getData()), socketAddress, localSocketAddress);
-                TCPSegmentType type = TCPSegmentType.typeOf(segment);
-                TOUSocketImpl impl;
-
-                if (type == SYN) {
-                    // SYN segment addressed to server socket associated with local address
-                    impl = implMap.get(localSocketAddress);
-                } else {
-                    // other segments addressed to socket associated with remote address
-                    impl = implMap.get(socketAddress);
-                }
-
-                if (impl == null) {
-                    continue;
-                }
-
-                impl.handle(segment);
-            }
-        } catch (InterruptedException | IOException e) {
-            e.printStackTrace();
-        }
-    }
-
-    void putInSendingQueue(TOUSegment segment)
+    ScheduledFuture<?> sendRepeatedly(TOUSegment segment, long sendingPeriod, TimeUnit timeUnit)
             throws InterruptedException {
-        segmentQueue.putPrev(segment);
+        return threadPoolExecutor.scheduleAtFixedRate(() -> {
+            try {
+                send(segment);
+            } catch (IOException e) {
+                e.printStackTrace();
+                throw new RuntimeException(e.getMessage());
+            }
+            if (segment.timedOut()) {
+                throw SEGMENT_TIMED_OUT;
+            }
+        }, 0, sendingPeriod, timeUnit);
     }
 
-    private boolean implMapIsEmpty() {
-        boolean implMapEmpty;
-        synchronized (implMap) {
-            implMapEmpty = implMap.isEmpty();
-        }
-        return implMapEmpty;
+    void sendOnce(TOUSegment segment) {
+        threadPoolExecutor.execute(() -> {
+            try {
+                send(segment);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        });
+    }
+
+    /**
+     * sweeper is a task that, when periodically executed, removes timed out
+     * segments from queues of each impl in {@code implMap}.
+     */
+    private void startSweeper() {
+        threadPoolExecutor.scheduleAtFixedRate(() -> {
+            for (TOUSocketImpl impl : implMap.values()) {
+                impl.sweepTimedOutSegmentsFromQueues();
+            }
+        }, SWEEPING_PERIOD, SWEEPING_PERIOD, TimeUnit.MILLISECONDS);
+    }
+
+    private void startFlusher() {
+        threadPoolExecutor.execute(() -> {
+            try {
+                while (!Thread.interrupted()) {
+                    implsWithData.take().flushAndSendIfAvailable();
+                }
+            } catch (InterruptedException ignored) {}
+        });
     }
 
     boolean isClosed() {
@@ -125,29 +156,24 @@ class TOUSharedCommunicator {
         synchronized (implMap) {
             implMap.remove(associatedAddress);
         }
-        closeDatagramSocket();
-    }
-
-    private void closeDatagramSocket() {
         if (implMapIsEmpty()) {
-            datagramSocket.close();
-            shouldStop = true;
+            stop();
         }
     }
 
-    boolean removeReference(TOUSegment segment) {
-        return removeIf(s -> s == segment);
+    private boolean implMapIsEmpty() {
+        boolean implMapEmpty;
+        synchronized (implMap) {
+            implMapEmpty = implMap.isEmpty();
+        }
+        return implMapEmpty;
     }
 
-    boolean removeIf(Predicate<TOUSegment> p) {
-        return segmentQueue.removeIf(p);
-    }
-
-    boolean removeByAck(TOUSegment ack) {
-        return removeIf(s ->
-                Objects.equals(s.getSrc(), ack.getDst()) &&
-                Objects.equals(s.getDst(), ack.getSrc()) &&
-                s.getSEQ() == ack.getACK());
+    private void stop() {
+        threadPoolExecutor.shutdown();
+        implsWithData.clear();
+        datagramSocket.close();
+        shouldStop = true;
     }
 
     public void registerImpl(InetSocketAddress associatedAddress, TOUSocketImpl impl) {
