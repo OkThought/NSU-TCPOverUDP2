@@ -1,32 +1,47 @@
 package ru.nsu.ccfit.bogush.net.tou.segment;
 
-import ru.nsu.ccfit.bogush.factory.Factory;
 import ru.nsu.ccfit.bogush.net.tcp.segment.TCPSegment;
 import ru.nsu.ccfit.bogush.net.tcp.segment.TCPSegmentFactory;
 import ru.nsu.ccfit.bogush.net.tcp.segment.TCPSegmentType;
 
 import java.net.InetSocketAddress;
 
-public class TOUSegmentFactory implements Factory<TOUSegment, TCPSegmentType> {
-    private final InetSocketAddress local;
-    private final InetSocketAddress remote;
-    private final TCPSegmentFactory tcpSegmentFactory = new TCPSegmentFactory();
+public final class TOUSegmentFactory {
+    private TOUSegmentFactory() {}
 
-    public TOUSegmentFactory(InetSocketAddress local, InetSocketAddress remote) {
-        this.local = local;
-        this.remote = remote;
+    public static TOUSegment create(TCPSegment segment, InetSocketAddress address) {
+        return create(segment, null, address);
     }
 
-    public TOUSegment create(TCPSegmentType type, Object... args) {
-        return new TOUSegment(tcpSegmentFactory.create(type, args), local, remote);
+    public static TOUSegment create(TCPSegment segment, InetSocketAddress src, InetSocketAddress dst) {
+        return new TOUSegment(segment, src, dst);
     }
 
-    public static TOUSegment staticCreate(TCPSegmentType type, InetSocketAddress local, InetSocketAddress remote,
-                                          Object... args) {
-        return new TOUSegment(TCPSegmentFactory.staticCreate(type, args), local, remote);
+    public static TOUSegment generateSYN(InetSocketAddress address) {
+        return create(TCPSegmentFactory.generateSYN(), address);
     }
 
-    public static TOUSegment staticCreate(TCPSegmentType type, TOUSegment segment) {
-        return new TOUSegment(TCPSegmentFactory.staticCreate(type, segment), segment.getDst(), segment.getSrc());
+    public static TOUSegment generateSYNACK(TOUSegment synack) {
+        return create(TCPSegmentFactory.generateSYNACK(synack.getSEQ()), synack.getDst(), synack.getSrc());
+    }
+
+    public static TOUSegment generateFIN(InetSocketAddress address) {
+        return create(TCPSegmentFactory.generateFIN(), address);
+    }
+
+    public static TOUSegment generateFINACK(TOUSegment fin) {
+        return create(TCPSegmentFactory.generateFINACK(fin.getSEQ()), fin.getDst(), fin.getSrc());
+    }
+
+    public static TOUSegment createEmptyACK(InetSocketAddress address, int seq) {
+        return create(TCPSegmentFactory.createEmptyACK(seq), address);
+    }
+
+    public static TOUSegment createEmptyACK(TOUSegment dataSegment) {
+        return create(TCPSegmentFactory.createEmptyACK(dataSegment.getSEQ()), dataSegment.getDst(), dataSegment.getSrc());
+    }
+
+    public static TOUSegment create(InetSocketAddress address, TCPSegmentType type, int seq, int ack) {
+        return create(TCPSegmentFactory.create(type, seq, ack), address);
     }
 }
