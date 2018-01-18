@@ -43,6 +43,7 @@ public class TOUSegment extends TCPSegment {
     public String toString() {
         return String.format("%16s[%s seq: %5d ack: %5d data offset: %3d capacity: %3d src: %16s:%-5d dst: %16s:%-5d]",
                 TOUSegment.class.getSimpleName(), flagsToString(), getSEQ(), getACK(), HEADER_SIZE, capacity(),
-                src.getAddress().getHostAddress(), src.getPort(), dst.getAddress().getHostAddress(), dst.getPort());
+                src == null ? null : src.getAddress().getHostAddress(), src == null ? -1 : src.getPort(),
+                dst == null ? null : dst.getAddress().getHostAddress(), dst == null ? -1 : dst.getPort());
     }
 }
