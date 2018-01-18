@@ -1,5 +1,7 @@
 package ru.nsu.ccfit.bogush.net.tou.socket;
 
+import ru.nsu.ccfit.bogush.net.tcp.segment.TCPSegment;
+
 import java.io.IOException;
 import java.io.OutputStream;
 
@@ -20,19 +22,23 @@ public class TOUOutputStream extends OutputStream {
     public synchronized void write(int b)
             throws IOException {
         if (impl.isClosedOrPending()) throw new IOException("Socket closed");
+        if (impl.isOutShut()) throw new IOException("Output shutdown");
 
         while (pos == buffer.length) {
             try {
                 wait();
-            } catch (InterruptedException e) {
-                throw new IOException(e);
-            }
+            } catch (InterruptedException ignored) {}
         }
         buffer[pos] = (byte) b;
         ++pos;
+        if (pos == 1) {
+            try {
+                impl.communicator.implsWithData.put(impl);
+            } catch (InterruptedException ignored) {}
+        }
     }
 
-    synchronized int available() {
+    int available() {
         return pos;
     }
 
@@ -40,12 +46,15 @@ public class TOUOutputStream extends OutputStream {
         return seq;
     }
 
-    synchronized byte[] flushBytes() {
-        byte[] result = new byte[pos];
-        System.arraycopy(buffer, 0, result, 0, pos);
+
+
+    synchronized TCPSegment flushIntoSegment() {
+        TCPSegment segment = new TCPSegment(pos);
+        byte[] dst = segment.getBytes();
+        System.arraycopy(buffer, 0, dst, segment.getDataOffset(), pos);
         pos = 0;
         ++seq;
         notifyAll();
-        return result;
+        return segment;
     }
 }
