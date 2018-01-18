@@ -165,6 +165,10 @@ public class TCPSegment {
         return buffer.getChar(DATA_SIZE);
     }
 
+    public int size() {
+        return bytes.length;
+    }
+
     public String flagsToString() {
         return String.valueOf(isSYN() ? 'S' : '-') + (isACK() ? 'A' : '-') + (isFIN() ? 'F' : '-');
     }
